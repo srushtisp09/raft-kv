@@ -40,6 +40,17 @@ type Raft struct {
 	role Role
 }
 
+func NewRaft(id int, peers []string) *Raft {
+	rf := &Raft{
+		id:       id,
+		peers:    peers,
+		votedFor: -1,                    // -1 means "no vote yet"
+		log:      []LogEntry{{Term: 0}}, // dummy entry at index 0
+		role:     Follower,
+	}
+	return rf
+}
+
 // RequestVoteArgs is sent by candidates to gather votes during elections.
 type RequestVoteArgs struct {
 	Term         int
