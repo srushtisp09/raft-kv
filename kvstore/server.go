@@ -15,8 +15,7 @@ type KVServer struct {
 	data        map[string]string
 	waitCh      map[int]chan Op
 	lastApplied map[int64]int64
-
-	localSeq int64
+	localSeq    int64
 
 	stopCh   chan struct{}
 	stopOnce sync.Once
@@ -114,6 +113,27 @@ func (kv *KVServer) Get(key string) (string, error) {
 
 func (kv *KVServer) Delete(key string) error {
 	op := kv.newLocalOp("Delete", key, "")
+	return kv.submit(op)
+}
+
+// Methods used by Clerk.
+
+func (kv *KVServer) PutWithOp(op Op) error {
+	return kv.submit(op)
+}
+
+func (kv *KVServer) GetWithOp(op Op) (string, error) {
+	if err := kv.submit(op); err != nil {
+		return "", err
+	}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	return kv.data[op.Key], nil
+}
+
+func (kv *KVServer) DeleteWithOp(op Op) error {
 	return kv.submit(op)
 }
 
