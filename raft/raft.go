@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"bytes"
+	"encoding/gob"
 	"math/rand"
 	"sync"
 	"time"
@@ -42,6 +44,9 @@ type Raft struct {
 	sendRequestVote   func(peer int, args *RequestVoteArgs, reply *RequestVoteReply) bool
 	sendAppendEntries func(peer int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool
 
+	// Where persistent state is saved.
+	persister Persister
+
 	// Persistent state.
 	currentTerm int
 	votedFor    int
@@ -68,17 +73,22 @@ type Raft struct {
 	killOnce sync.Once
 }
 
-// NewRaft creates a follower and starts its ticker and applier.
-func NewRaft(id int, peers []string, applyCh chan ApplyMsg) *Raft {
+// NewRaft creates a follower, restores any saved state, and starts its
+// ticker and applier.
+func NewRaft(id int, peers []string, applyCh chan ApplyMsg, persister Persister) *Raft {
 	rf := &Raft{
-		id:       id,
-		peers:    peers,
-		votedFor: -1,
-		log:      []LogEntry{{Term: 0}}, // dummy entry at index 0
-		role:     Follower,
-		applyCh:  applyCh,
-		stopCh:   make(chan struct{}),
+		id:        id,
+		peers:     peers,
+		votedFor:  -1,
+		log:       []LogEntry{{Term: 0}}, // dummy entry at index 0
+		role:      Follower,
+		applyCh:   applyCh,
+		persister: persister,
+		stopCh:    make(chan struct{}),
 	}
+
+	// No goroutines are running yet, so no lock is needed.
+	rf.readPersist()
 
 	rf.mu.Lock()
 	rf.resetElectionTimer()
@@ -88,6 +98,64 @@ func NewRaft(id int, peers []string, applyCh chan ApplyMsg) *Raft {
 	go rf.applier()
 
 	return rf
+}
+
+// persist saves currentTerm, votedFor and log. Must be called with rf.mu held,
+// and BEFORE replying to an RPC or sending a message that depends on the change.
+func (rf *Raft) persist() {
+	if rf.persister == nil {
+		return
+	}
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(rf.currentTerm); err != nil {
+		panic(err)
+	}
+	if err := enc.Encode(rf.votedFor); err != nil {
+		panic(err)
+	}
+	if err := enc.Encode(rf.log); err != nil {
+		panic(err)
+	}
+	// If the disk write fails we must not carry on as if the vote or entry
+	// was saved, so crashing is the safe choice.
+	if err := rf.persister.Save(buf.Bytes()); err != nil {
+		panic(err)
+	}
+}
+
+// readPersist restores saved state. Called once from NewRaft.
+func (rf *Raft) readPersist() {
+	if rf.persister == nil {
+		return
+	}
+	data, err := rf.persister.Load()
+	if err != nil {
+		panic(err)
+	}
+	if len(data) == 0 {
+		return // brand-new node, nothing saved
+	}
+
+	dec := gob.NewDecoder(bytes.NewReader(data))
+	var term, votedFor int
+	var entries []LogEntry
+	if err := dec.Decode(&term); err != nil {
+		panic(err)
+	}
+	if err := dec.Decode(&votedFor); err != nil {
+		panic(err)
+	}
+	if err := dec.Decode(&entries); err != nil {
+		panic(err)
+	}
+	if len(entries) == 0 {
+		panic("persisted log is missing its dummy entry")
+	}
+
+	rf.currentTerm = term
+	rf.votedFor = votedFor
+	rf.log = entries
 }
 
 // setSendRequestVote swaps the transport safely while the ticker is running.
@@ -122,6 +190,7 @@ func (rf *Raft) Start(command string) (int, int, bool) {
 	}
 
 	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
+	rf.persist()
 	index := len(rf.log) - 1
 
 	rf.advanceCommitIndex() // lets a single-node cluster commit right away
@@ -197,6 +266,7 @@ func (rf *Raft) startElection() {
 
 	rf.role = Candidate
 	rf.votedFor = rf.id
+	rf.persist() // new term + self-vote must be on disk before asking for votes
 	rf.resetElectionTimer()
 
 	// 2. Prepare vote request.
@@ -393,6 +463,7 @@ func (rf *Raft) becomeFollower(term int) {
 	if term > rf.currentTerm {
 		rf.currentTerm = term
 		rf.votedFor = -1
+		rf.persist()
 	}
 }
 
@@ -454,18 +525,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Rule 3: append new entries. Truncate ONLY on a real conflict,
 	// otherwise a delayed duplicate RPC would delete good entries.
+	logChanged := false
 	for i, entry := range args.Entries {
 		idx := args.PrevLogIndex + 1 + i
 		if idx < len(rf.log) {
 			if rf.log[idx].Term != entry.Term {
 				rf.log = append(rf.log[:idx], args.Entries[i:]...)
+				logChanged = true
 				break
 			}
 			// same term at same index: already have it, keep going
 		} else {
 			rf.log = append(rf.log, args.Entries[i:]...)
+			logChanged = true
 			break
 		}
+	}
+	if logChanged {
+		rf.persist() // before we reply Success
 	}
 
 	// Rule 4: advance commitIndex.
@@ -507,6 +584,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 4. Grant vote if allowed.
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && upToDate {
 		rf.votedFor = args.CandidateId
+		rf.persist() // vote must be on disk before we reply "granted"
 		reply.VoteGranted = true
 		rf.resetElectionTimer()
 	}
