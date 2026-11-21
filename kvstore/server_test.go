@@ -41,7 +41,7 @@ func waitForLeader(t *testing.T, kv *KVServer) {
 		}
 
 		if !errors.Is(err, ErrWrongLeader) {
-			t.Fatalf("Put failed: %v", err)
+			t.Fatalf("Put failed while waiting for leader: %v", err)
 		}
 
 		time.Sleep(20 * time.Millisecond)
@@ -52,7 +52,6 @@ func waitForLeader(t *testing.T, kv *KVServer) {
 
 func TestPutGetDelete(t *testing.T) {
 	kv := newSingleNodeKV(t)
-
 	waitForLeader(t, kv)
 
 	err := kv.Put("name", "Alice")
@@ -81,5 +80,26 @@ func TestPutGetDelete(t *testing.T) {
 
 	if value != "" {
 		t.Fatalf("expected empty value, got %q", value)
+	}
+}
+
+func TestClerkPutGetDelete(t *testing.T) {
+	kv := newSingleNodeKV(t)
+	waitForLeader(t, kv)
+
+	ck := MakeClerk([]*KVServer{kv})
+
+	ck.Put("name", "Alice")
+
+	value := ck.Get("name")
+	if value != "Alice" {
+		t.Fatalf("expected Alice, got %q", value)
+	}
+
+	ck.Delete("name")
+
+	value = ck.Get("name")
+	if value != "" {
+		t.Fatalf("expected empty value after Delete, got %q", value)
 	}
 }
