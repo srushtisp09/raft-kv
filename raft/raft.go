@@ -12,6 +12,12 @@ type LogEntry struct {
 	Command string
 }
 
+// ApplyMsg is delivered to the KV layer when an entry is committed.
+type ApplyMsg struct {
+	Index   int
+	Command string
+}
+
 // Role defines the state of a Raft server.
 type Role int
 
@@ -55,18 +61,22 @@ type Raft struct {
 	lastHeartbeat   time.Time
 	electionTimeout time.Duration
 
+	// Committed entries are delivered here, in order.
+	applyCh chan ApplyMsg
+
 	stopCh   chan struct{}
 	killOnce sync.Once
 }
 
-// NewRaft creates a follower and starts its ticker.
-func NewRaft(id int, peers []string) *Raft {
+// NewRaft creates a follower and starts its ticker and applier.
+func NewRaft(id int, peers []string, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{
 		id:       id,
 		peers:    peers,
 		votedFor: -1,
-		log:      []LogEntry{{Term: 0}},
+		log:      []LogEntry{{Term: 0}}, // dummy entry at index 0
 		role:     Follower,
+		applyCh:  applyCh,
 		stopCh:   make(chan struct{}),
 	}
 
@@ -75,6 +85,7 @@ func NewRaft(id int, peers []string) *Raft {
 	rf.mu.Unlock()
 
 	go rf.ticker()
+	go rf.applier()
 
 	return rf
 }
@@ -98,6 +109,25 @@ func (rf *Raft) Kill() {
 	rf.killOnce.Do(func() {
 		close(rf.stopCh)
 	})
+}
+
+// Start is called on the leader when a client sends a command.
+// It returns (index, term, isLeader).
+func (rf *Raft) Start(command string) (int, int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.role != Leader {
+		return -1, rf.currentTerm, false
+	}
+
+	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
+	index := len(rf.log) - 1
+
+	rf.advanceCommitIndex() // lets a single-node cluster commit right away
+	go rf.broadcastAppendEntries(rf.currentTerm)
+
+	return index, rf.currentTerm, true
 }
 
 // resetElectionTimer must be called with rf.mu held.
@@ -125,6 +155,37 @@ func (rf *Raft) ticker() {
 		}
 
 		rf.mu.Unlock()
+	}
+}
+
+// applier delivers committed entries to applyCh, in order.
+func (rf *Raft) applier() {
+	for {
+		select {
+		case <-rf.stopCh:
+			return
+		case <-time.After(10 * time.Millisecond):
+		}
+
+		rf.mu.Lock()
+		var msgs []ApplyMsg
+		for rf.lastApplied < rf.commitIndex {
+			rf.lastApplied++
+			msgs = append(msgs, ApplyMsg{
+				Index:   rf.lastApplied,
+				Command: rf.log[rf.lastApplied].Command,
+			})
+		}
+		rf.mu.Unlock()
+
+		// Send with no lock held, so a full channel can't freeze the node.
+		for _, m := range msgs {
+			select {
+			case rf.applyCh <- m:
+			case <-rf.stopCh:
+				return
+			}
+		}
 	}
 }
 
@@ -212,49 +273,114 @@ func (rf *Raft) becomeLeader() {
 	go rf.heartbeatLoop(rf.currentTerm)
 }
 
-// heartbeatLoop sends empty AppendEntries every 100 ms while we are the
-// leader of the given term.
+// heartbeatLoop sends AppendEntries to every peer every 100 ms
+// while we are the leader of the given term.
 func (rf *Raft) heartbeatLoop(term int) {
 	for {
-		rf.mu.Lock()
-		if rf.role != Leader || rf.currentTerm != term {
-			rf.mu.Unlock()
-			return
-		}
-		last := len(rf.log) - 1
-		args := AppendEntriesArgs{
-			Term:         term,
-			LeaderId:     rf.id,
-			PrevLogIndex: last,
-			PrevLogTerm:  rf.log[last].Term,
-			LeaderCommit: rf.commitIndex,
-		}
-		send := rf.sendAppendEntries
-		rf.mu.Unlock()
-
-		if send != nil {
-			for peer := range rf.peers {
-				if peer == rf.id {
-					continue
-				}
-				go func(peer int) {
-					var reply AppendEntriesReply
-					if !send(peer, &args, &reply) {
-						return
-					}
-					rf.mu.Lock()
-					defer rf.mu.Unlock()
-					if reply.Term > rf.currentTerm {
-						rf.becomeFollower(reply.Term)
-					}
-				}(peer)
-			}
-		}
+		rf.broadcastAppendEntries(term)
 
 		select {
 		case <-rf.stopCh:
 			return
 		case <-time.After(100 * time.Millisecond):
+		}
+
+		rf.mu.Lock()
+		stillLeader := rf.role == Leader && rf.currentTerm == term
+		rf.mu.Unlock()
+		if !stillLeader {
+			return
+		}
+	}
+}
+
+// broadcastAppendEntries sends each peer the entries it is missing
+// (an empty list is a heartbeat).
+func (rf *Raft) broadcastAppendEntries(term int) {
+	rf.mu.Lock()
+	if rf.role != Leader || rf.currentTerm != term || rf.sendAppendEntries == nil {
+		rf.mu.Unlock()
+		return
+	}
+	send := rf.sendAppendEntries
+
+	// Build each peer's args under the lock.
+	argsList := make([]AppendEntriesArgs, len(rf.peers))
+	for peer := range rf.peers {
+		if peer == rf.id {
+			continue
+		}
+		prev := rf.nextIndex[peer] - 1
+		entries := make([]LogEntry, len(rf.log)-rf.nextIndex[peer])
+		copy(entries, rf.log[rf.nextIndex[peer]:]) // copy: the log may change after we unlock
+		argsList[peer] = AppendEntriesArgs{
+			Term:         term,
+			LeaderId:     rf.id,
+			PrevLogIndex: prev,
+			PrevLogTerm:  rf.log[prev].Term,
+			Entries:      entries,
+			LeaderCommit: rf.commitIndex,
+		}
+	}
+	rf.mu.Unlock()
+
+	// Send with no lock held.
+	for peer := range rf.peers {
+		if peer == rf.id {
+			continue
+		}
+		go func(peer int, args AppendEntriesArgs) {
+			var reply AppendEntriesReply
+			if !send(peer, &args, &reply) {
+				return
+			}
+
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			if reply.Term > rf.currentTerm {
+				rf.becomeFollower(reply.Term)
+				return
+			}
+			if rf.role != Leader || rf.currentTerm != term {
+				return // stale reply
+			}
+
+			if reply.Success {
+				// Use what we SENT, not len(rf.log) now: the log may have grown.
+				match := args.PrevLogIndex + len(args.Entries)
+				if match > rf.matchIndex[peer] {
+					rf.matchIndex[peer] = match
+				}
+				rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+				rf.advanceCommitIndex()
+			} else if args.PrevLogIndex < rf.nextIndex[peer] {
+				// Walk back to the point we just tried (never below 1).
+				rf.nextIndex[peer] = max(1, args.PrevLogIndex)
+			}
+		}(peer, argsList[peer])
+	}
+}
+
+// advanceCommitIndex must be called with rf.mu held.
+func (rf *Raft) advanceCommitIndex() {
+	for n := len(rf.log) - 1; n > rf.commitIndex; n-- {
+		// Figure 8 rule: only commit entries from the CURRENT term by
+		// counting replicas. An old-term entry can be on a majority and
+		// still be overwritten by a later leader, so it only becomes
+		// committed indirectly, when a current-term entry after it commits.
+		if rf.log[n].Term != rf.currentTerm {
+			break
+		}
+		count := 1 // our own log
+		for peer := range rf.peers {
+			if peer != rf.id && rf.matchIndex[peer] >= n {
+				count++
+			}
+		}
+		if count > len(rf.peers)/2 {
+			rf.commitIndex = n
+			break
 		}
 	}
 }
@@ -317,7 +443,37 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	rf.resetElectionTimer()
 
-	// TODO: Log consistency and replication.
+	// Rule 1: our log is too short to contain PrevLogIndex.
+	if args.PrevLogIndex >= len(rf.log) {
+		return
+	}
+	// Rule 2: we have that index, but the term doesn't match.
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		return
+	}
+
+	// Rule 3: append new entries. Truncate ONLY on a real conflict,
+	// otherwise a delayed duplicate RPC would delete good entries.
+	for i, entry := range args.Entries {
+		idx := args.PrevLogIndex + 1 + i
+		if idx < len(rf.log) {
+			if rf.log[idx].Term != entry.Term {
+				rf.log = append(rf.log[:idx], args.Entries[i:]...)
+				break
+			}
+			// same term at same index: already have it, keep going
+		} else {
+			rf.log = append(rf.log, args.Entries[i:]...)
+			break
+		}
+	}
+
+	// Rule 4: advance commitIndex.
+	if args.LeaderCommit > rf.commitIndex {
+		lastNew := args.PrevLogIndex + len(args.Entries)
+		rf.commitIndex = min(args.LeaderCommit, lastNew)
+	}
+
 	reply.Success = true
 }
 

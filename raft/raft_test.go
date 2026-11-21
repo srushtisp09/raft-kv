@@ -8,7 +8,7 @@ import (
 
 // Creates a Raft server with a fake RequestVote function.
 func newTestRaft(id int, peers []string, fakeVote func(peer int, args *RequestVoteArgs, reply *RequestVoteReply) bool) *Raft {
-	rf := NewRaft(id, peers)
+	rf := NewRaft(id, peers, make(chan ApplyMsg, 100))
 	rf.setSendRequestVote(fakeVote)
 	return rf
 }
@@ -108,9 +108,10 @@ func TestElectionNoMajority(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 type cluster struct {
-	nodes []*Raft
-	mu    sync.Mutex
-	down  []bool // true = node is cut off from the network
+	nodes    []*Raft
+	applyChs []chan ApplyMsg
+	mu       sync.Mutex
+	down     []bool // true = node is cut off from the network
 }
 
 func (c *cluster) isDown(i int) bool {
@@ -132,11 +133,13 @@ func makeCluster(n int) *cluster {
 	}
 
 	c := &cluster{
-		nodes: make([]*Raft, n),
-		down:  make([]bool, n),
+		nodes:    make([]*Raft, n),
+		applyChs: make([]chan ApplyMsg, n),
+		down:     make([]bool, n),
 	}
 	for i := 0; i < n; i++ {
-		c.nodes[i] = NewRaft(i, peers)
+		c.applyChs[i] = make(chan ApplyMsg, 100)
+		c.nodes[i] = NewRaft(i, peers, c.applyChs[i])
 	}
 
 	for i := 0; i < n; i++ {
@@ -226,5 +229,52 @@ func TestClusterReelectsAfterLeaderFailure(t *testing.T) {
 	newLeader := waitForOneLeader(t, c)
 	if newLeader == old {
 		t.Fatalf("expected a new leader, but %d is still leader", old)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Log replication tests
+// ---------------------------------------------------------------------------
+
+// Test 6: a command replicates to every node and is applied everywhere.
+func TestReplicatesCommand(t *testing.T) {
+	c := makeCluster(3)
+	defer c.killAll()
+
+	leader := waitForOneLeader(t, c)
+	idx, _, ok := c.nodes[leader].Start("SET name Nobita")
+	if !ok {
+		t.Fatal("leader rejected command")
+	}
+
+	for i, ch := range c.applyChs {
+		select {
+		case msg := <-ch:
+			if msg.Index != idx || msg.Command != "SET name Nobita" {
+				t.Fatalf("node %d applied wrong entry: %+v", i, msg)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("node %d never applied the command", i)
+		}
+	}
+}
+
+// Test 7: a command committed before the leader dies is not lost.
+func TestCommittedEntrySurvivesLeaderFailure(t *testing.T) {
+	c := makeCluster(3)
+	defer c.killAll()
+
+	old := waitForOneLeader(t, c)
+	c.nodes[old].Start("A")
+	time.Sleep(500 * time.Millisecond) // let it commit and replicate
+
+	c.setDown(old, true)
+	c.nodes[old].Kill()
+
+	newLeader := waitForOneLeader(t, c)
+	c.nodes[newLeader].mu.Lock()
+	defer c.nodes[newLeader].mu.Unlock()
+	if len(c.nodes[newLeader].log) < 2 || c.nodes[newLeader].log[1].Command != "A" {
+		t.Fatalf("new leader lost the committed entry: %+v", c.nodes[newLeader].log)
 	}
 }
