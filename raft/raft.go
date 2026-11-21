@@ -21,6 +21,10 @@ const (
 	Leader
 )
 
+func (r Role) String() string {
+	return [...]string{"Follower", "Candidate", "Leader"}[r]
+}
+
 // Raft represents a single node.
 type Raft struct {
 	mu sync.Mutex
@@ -28,12 +32,9 @@ type Raft struct {
 	id    int
 	peers []string
 
-	// Fake RPC transport for testing.
-	sendRequestVote func(
-		peer int,
-		args *RequestVoteArgs,
-		reply *RequestVoteReply,
-	) bool
+	// Swappable transport (fake in tests, real net/rpc later).
+	sendRequestVote   func(peer int, args *RequestVoteArgs, reply *RequestVoteReply) bool
+	sendAppendEntries func(peer int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool
 
 	// Persistent state.
 	currentTerm int
@@ -78,7 +79,21 @@ func NewRaft(id int, peers []string) *Raft {
 	return rf
 }
 
-// Kill stops the ticker.
+// setSendRequestVote swaps the transport safely while the ticker is running.
+func (rf *Raft) setSendRequestVote(f func(int, *RequestVoteArgs, *RequestVoteReply) bool) {
+	rf.mu.Lock()
+	rf.sendRequestVote = f
+	rf.mu.Unlock()
+}
+
+// setSendAppendEntries swaps the transport safely while the ticker is running.
+func (rf *Raft) setSendAppendEntries(f func(int, *AppendEntriesArgs, *AppendEntriesReply) bool) {
+	rf.mu.Lock()
+	rf.sendAppendEntries = f
+	rf.mu.Unlock()
+}
+
+// Kill stops all background goroutines. Safe to call more than once.
 func (rf *Raft) Kill() {
 	rf.killOnce.Do(func() {
 		close(rf.stopCh)
@@ -115,7 +130,6 @@ func (rf *Raft) ticker() {
 
 // startElection must be called with rf.mu held.
 func (rf *Raft) startElection() {
-
 	// 1. Start a new election.
 	rf.currentTerm++
 	electionTerm := rf.currentTerm
@@ -143,7 +157,7 @@ func (rf *Raft) startElection() {
 
 	// A single-node cluster needs no RPCs.
 	if votes > len(rf.peers)/2 {
-		rf.role = Leader
+		rf.becomeLeader()
 		return
 	}
 
@@ -157,43 +171,96 @@ func (rf *Raft) startElection() {
 			var reply RequestVoteReply
 
 			// Never hold rf.mu during RPC.
-			if sendVote == nil ||
-				!sendVote(peer, &args, &reply) {
+			if sendVote == nil || !sendVote(peer, &args, &reply) {
 				return
 			}
 
-			// Lock again to process response.
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 
-			// 6. Higher term: step down.
+			// Check A: higher term, step down.
 			if reply.Term > rf.currentTerm {
 				rf.becomeFollower(reply.Term)
-				rf.resetElectionTimer()
 				return
 			}
 
-			// 7. Ignore outdated election responses.
-			if rf.role != Candidate ||
-				rf.currentTerm != electionTerm {
+			// Check B: ignore outdated election responses.
+			if rf.role != Candidate || rf.currentTerm != electionTerm {
 				return
 			}
 
-			// 8. Count granted votes.
+			// Check C: count granted votes, check majority.
 			if reply.VoteGranted {
 				votes++
+				if votes > len(rf.peers)/2 {
+					rf.becomeLeader()
+				}
 			}
-
-			// 9. Check majority.
-			if votes > len(rf.peers)/2 {
-				rf.role = Leader
-			}
-
 		}(peer)
 	}
 }
 
+// becomeLeader must be called with rf.mu held.
+func (rf *Raft) becomeLeader() {
+	rf.role = Leader
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	for i := range rf.peers {
+		rf.nextIndex[i] = len(rf.log)
+		rf.matchIndex[i] = 0
+	}
+	go rf.heartbeatLoop(rf.currentTerm)
+}
+
+// heartbeatLoop sends empty AppendEntries every 100 ms while we are the
+// leader of the given term.
+func (rf *Raft) heartbeatLoop(term int) {
+	for {
+		rf.mu.Lock()
+		if rf.role != Leader || rf.currentTerm != term {
+			rf.mu.Unlock()
+			return
+		}
+		last := len(rf.log) - 1
+		args := AppendEntriesArgs{
+			Term:         term,
+			LeaderId:     rf.id,
+			PrevLogIndex: last,
+			PrevLogTerm:  rf.log[last].Term,
+			LeaderCommit: rf.commitIndex,
+		}
+		send := rf.sendAppendEntries
+		rf.mu.Unlock()
+
+		if send != nil {
+			for peer := range rf.peers {
+				if peer == rf.id {
+					continue
+				}
+				go func(peer int) {
+					var reply AppendEntriesReply
+					if !send(peer, &args, &reply) {
+						return
+					}
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					if reply.Term > rf.currentTerm {
+						rf.becomeFollower(reply.Term)
+					}
+				}(peer)
+			}
+		}
+
+		select {
+		case <-rf.stopCh:
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
 // becomeFollower must be called with rf.mu held.
+// The vote is cleared only when the term increases.
 func (rf *Raft) becomeFollower(term int) {
 	rf.role = Follower
 
@@ -232,10 +299,7 @@ type AppendEntriesReply struct {
 }
 
 // AppendEntries handles heartbeats and log replication.
-func (rf *Raft) AppendEntries(
-	args *AppendEntriesArgs,
-	reply *AppendEntriesReply,
-) {
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -258,10 +322,7 @@ func (rf *Raft) AppendEntries(
 }
 
 // RequestVote handles incoming vote requests.
-func (rf *Raft) RequestVote(
-	args *RequestVoteArgs,
-	reply *RequestVoteReply,
-) {
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -285,13 +346,10 @@ func (rf *Raft) RequestVote(
 	lastTerm := rf.log[lastIndex].Term
 
 	upToDate := args.LastLogTerm > lastTerm ||
-		(args.LastLogTerm == lastTerm &&
-			args.LastLogIndex >= lastIndex)
+		(args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex)
 
 	// 4. Grant vote if allowed.
-	if (rf.votedFor == -1 ||
-		rf.votedFor == args.CandidateId) && upToDate {
-
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && upToDate {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		rf.resetElectionTimer()
