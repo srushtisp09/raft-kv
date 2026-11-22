@@ -2,6 +2,7 @@ package kvstore
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -291,5 +292,57 @@ func TestClerkWorksAfterLeaderCrash(t *testing.T) {
 
 	case <-time.After(8 * time.Second):
 		t.Fatal("Clerk could not retrieve the value after leader crash")
+	}
+}
+func TestConcurrentClerks(t *testing.T) {
+	kv := newSingleNodeKV(t)
+	waitForLeader(t, kv)
+
+	const clientCount = 5
+	const operationsPerClient = 10
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, clientCount)
+
+	// Start multiple independent clients concurrently.
+	for clientID := 0; clientID < clientCount; clientID++ {
+		wg.Add(1)
+
+		go func(id int) {
+			defer wg.Done()
+
+			// Each client gets its own Clerk and ClientID.
+			ck := MakeClerk([]*KVServer{kv})
+
+			// Each client writes and reads its own keys.
+			for j := 0; j < operationsPerClient; j++ {
+				key := fmt.Sprintf("client-%d-key-%d", id, j)
+				expected := fmt.Sprintf("value-%d-%d", id, j)
+
+				ck.Put(key, expected)
+
+				actual := ck.Get(key)
+
+				if actual != expected {
+					errCh <- fmt.Errorf(
+						"client %d: key %s: expected %q, got %q",
+						id,
+						key,
+						expected,
+						actual,
+					)
+					return
+				}
+			}
+		}(clientID)
+	}
+
+	// Wait for every client to finish.
+	wg.Wait()
+	close(errCh)
+
+	// Report any incorrect reads.
+	for err := range errCh {
+		t.Error(err)
 	}
 }
