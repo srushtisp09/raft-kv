@@ -10,6 +10,17 @@ import (
 	"github.com/srushtisp09/raft-kv/raft"
 )
 
+// Converts []*KVServer into []KVService.
+func toKVServices(kvs []*KVServer) []KVService {
+	services := make([]KVService, len(kvs))
+
+	for i, kv := range kvs {
+		services[i] = kv
+	}
+
+	return services
+}
+
 func newSingleNodeKV(t *testing.T) *KVServer {
 	applyCh := make(chan raft.ApplyMsg, 100)
 
@@ -89,7 +100,7 @@ func TestClerkPutGetDelete(t *testing.T) {
 	kv := newSingleNodeKV(t)
 	waitForLeader(t, kv)
 
-	ck := MakeClerk([]*KVServer{kv})
+	ck := MakeClerk(toKVServices([]*KVServer{kv}))
 
 	ck.Put("name", "Alice")
 
@@ -105,6 +116,7 @@ func TestClerkPutGetDelete(t *testing.T) {
 		t.Fatalf("expected empty value after Delete, got %q", value)
 	}
 }
+
 func TestDuplicateRequestDetection(t *testing.T) {
 	kv := newSingleNodeKV(t)
 	waitForLeader(t, kv)
@@ -141,6 +153,7 @@ func TestDuplicateRequestDetection(t *testing.T) {
 		t.Fatalf("expected Alice, got %q", value)
 	}
 }
+
 func TestClerkWorksAfterLeaderCrash(t *testing.T) {
 	const nodeCount = 3
 
@@ -150,11 +163,9 @@ func TestClerkWorksAfterLeaderCrash(t *testing.T) {
 	applyChs := make([]chan raft.ApplyMsg, nodeCount)
 	kvs := make([]*KVServer, nodeCount)
 
-	// Tracks which servers are unavailable.
 	var networkMu sync.Mutex
 	down := make([]bool, nodeCount)
 
-	// Create all Raft nodes first.
 	for i := 0; i < nodeCount; i++ {
 		applyChs[i] = make(chan raft.ApplyMsg, 100)
 
@@ -166,7 +177,6 @@ func TestClerkWorksAfterLeaderCrash(t *testing.T) {
 		)
 	}
 
-	// Connect every Raft node to every other node.
 	for i := 0; i < nodeCount; i++ {
 		from := i
 
@@ -198,12 +208,10 @@ func TestClerkWorksAfterLeaderCrash(t *testing.T) {
 		)
 	}
 
-	// Create a KV server on top of each Raft node.
 	for i := 0; i < nodeCount; i++ {
 		kvs[i] = NewKVServer(nodes[i], applyChs[i])
 	}
 
-	// Clean up all servers when the test finishes.
 	t.Cleanup(func() {
 		for _, kv := range kvs {
 			kv.Kill()
@@ -214,7 +222,6 @@ func TestClerkWorksAfterLeaderCrash(t *testing.T) {
 		}
 	})
 
-	// Wait until one of the nodes becomes leader.
 	waitForClusterLeader := func() int {
 		deadline := time.Now().Add(5 * time.Second)
 
@@ -241,34 +248,27 @@ func TestClerkWorksAfterLeaderCrash(t *testing.T) {
 		return -1
 	}
 
-	// Create a Clerk that can contact all three servers.
-	ck := MakeClerk(kvs)
+	ck := MakeClerk(toKVServices(kvs))
 
-	// Find the initial leader.
 	oldLeader := waitForClusterLeader()
 	t.Logf("Initial leader: server %d", oldLeader)
 
-	// Write data while the cluster has a leader.
 	ck.Put("language", "Go")
 
-	// Verify that the value was stored.
 	value := ck.Get("language")
 	if value != "Go" {
 		t.Fatalf("expected Go before crash, got %q", value)
 	}
 
-	// Mark the current leader as unavailable.
 	networkMu.Lock()
 	down[oldLeader] = true
 	networkMu.Unlock()
 
-	// Crash the old leader.
 	kvs[oldLeader].Kill()
 	nodes[oldLeader].Kill()
 
 	t.Logf("Crashed leader: server %d", oldLeader)
 
-	// The remaining two nodes should elect a new leader.
 	newLeader := waitForClusterLeader()
 
 	if newLeader == oldLeader {
@@ -277,7 +277,6 @@ func TestClerkWorksAfterLeaderCrash(t *testing.T) {
 
 	t.Logf("New leader: server %d", newLeader)
 
-	// The Clerk should retry and retrieve the previously stored value.
 	resultCh := make(chan string, 1)
 
 	go func() {
@@ -294,6 +293,7 @@ func TestClerkWorksAfterLeaderCrash(t *testing.T) {
 		t.Fatal("Clerk could not retrieve the value after leader crash")
 	}
 }
+
 func TestConcurrentClerks(t *testing.T) {
 	kv := newSingleNodeKV(t)
 	waitForLeader(t, kv)
@@ -304,17 +304,14 @@ func TestConcurrentClerks(t *testing.T) {
 	var wg sync.WaitGroup
 	errCh := make(chan error, clientCount)
 
-	// Start multiple independent clients concurrently.
 	for clientID := 0; clientID < clientCount; clientID++ {
 		wg.Add(1)
 
 		go func(id int) {
 			defer wg.Done()
 
-			// Each client gets its own Clerk and ClientID.
-			ck := MakeClerk([]*KVServer{kv})
+			ck := MakeClerk(toKVServices([]*KVServer{kv}))
 
-			// Each client writes and reads its own keys.
 			for j := 0; j < operationsPerClient; j++ {
 				key := fmt.Sprintf("client-%d-key-%d", id, j)
 				expected := fmt.Sprintf("value-%d-%d", id, j)
@@ -337,12 +334,56 @@ func TestConcurrentClerks(t *testing.T) {
 		}(clientID)
 	}
 
-	// Wait for every client to finish.
 	wg.Wait()
 	close(errCh)
 
-	// Report any incorrect reads.
 	for err := range errCh {
 		t.Error(err)
 	}
+}
+
+func TestClerkOverTCP(t *testing.T) {
+	// Start a single-node Raft-backed KV server.
+	kv := newSingleNodeKV(t)
+	waitForLeader(t, kv)
+
+	// Start its RPC server on an available TCP port.
+	listener, err := ServeKV(kv, "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start KV RPC server: %v", err)
+	}
+	t.Cleanup(func() {
+		listener.Close()
+	})
+
+	// Connect a remote KV client to the RPC server.
+	client, err := NewKVClient(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to connect KV RPC client: %v", err)
+	}
+	t.Cleanup(func() {
+		client.Close()
+	})
+
+	// The Clerk now talks to KVClient over TCP.
+	ck := MakeClerk([]KVService{client})
+
+	// Test Put.
+	ck.Put("language", "Go")
+
+	// Test Get.
+	value := ck.Get("language")
+	if value != "Go" {
+		t.Fatalf("expected Go, got %q", value)
+	}
+
+	// Test Delete.
+	ck.Delete("language")
+
+	value = ck.Get("language")
+	if value != "" {
+		t.Fatalf("expected empty value after Delete, got %q", value)
+	}
+
+	t.Log("Clerk successfully used KV operations over TCP")
 }

@@ -11,7 +11,7 @@ var nextClientID int64
 type Clerk struct {
 	mu sync.Mutex
 
-	servers []*KVServer
+	servers []KVService
 
 	leader   int
 	clientID int64
@@ -19,7 +19,7 @@ type Clerk struct {
 }
 
 // MakeClerk creates a new client.
-func MakeClerk(servers []*KVServer) *Clerk {
+func MakeClerk(servers []KVService) *Clerk {
 	return &Clerk{
 		servers:  servers,
 		leader:   0,
