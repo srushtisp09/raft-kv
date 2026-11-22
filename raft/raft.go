@@ -179,6 +179,23 @@ func (rf *Raft) Kill() {
 	})
 }
 
+// GetState returns the current term and whether this node is the leader.
+func (rf *Raft) GetState() (int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	return rf.currentTerm, rf.role == Leader
+}
+
+// SetTransport configures how this node communicates with other Raft peers.
+func (rf *Raft) SetTransport(
+	sendVote func(int, *RequestVoteArgs, *RequestVoteReply) bool,
+	sendAppend func(int, *AppendEntriesArgs, *AppendEntriesReply) bool,
+) {
+	rf.setSendRequestVote(sendVote)
+	rf.setSendAppendEntries(sendAppend)
+}
+
 // Start is called on the leader when a client sends a command.
 // It returns (index, term, isLeader).
 func (rf *Raft) Start(command string) (int, int, bool) {
@@ -266,7 +283,7 @@ func (rf *Raft) startElection() {
 
 	rf.role = Candidate
 	rf.votedFor = rf.id
-	rf.persist() // new term + self-vote must be on disk before asking for votes
+	rf.persist()
 	rf.resetElectionTimer()
 
 	// 2. Prepare vote request.
@@ -382,7 +399,7 @@ func (rf *Raft) broadcastAppendEntries(term int) {
 		}
 		prev := rf.nextIndex[peer] - 1
 		entries := make([]LogEntry, len(rf.log)-rf.nextIndex[peer])
-		copy(entries, rf.log[rf.nextIndex[peer]:]) // copy: the log may change after we unlock
+		copy(entries, rf.log[rf.nextIndex[peer]:])
 		argsList[peer] = AppendEntriesArgs{
 			Term:         term,
 			LeaderId:     rf.id,
@@ -413,11 +430,10 @@ func (rf *Raft) broadcastAppendEntries(term int) {
 				return
 			}
 			if rf.role != Leader || rf.currentTerm != term {
-				return // stale reply
+				return
 			}
 
 			if reply.Success {
-				// Use what we SENT, not len(rf.log) now: the log may have grown.
 				match := args.PrevLogIndex + len(args.Entries)
 				if match > rf.matchIndex[peer] {
 					rf.matchIndex[peer] = match
@@ -425,7 +441,6 @@ func (rf *Raft) broadcastAppendEntries(term int) {
 				rf.nextIndex[peer] = rf.matchIndex[peer] + 1
 				rf.advanceCommitIndex()
 			} else if args.PrevLogIndex < rf.nextIndex[peer] {
-				// Walk back to the point we just tried (never below 1).
 				rf.nextIndex[peer] = max(1, args.PrevLogIndex)
 			}
 		}(peer, argsList[peer])
@@ -435,14 +450,10 @@ func (rf *Raft) broadcastAppendEntries(term int) {
 // advanceCommitIndex must be called with rf.mu held.
 func (rf *Raft) advanceCommitIndex() {
 	for n := len(rf.log) - 1; n > rf.commitIndex; n-- {
-		// Figure 8 rule: only commit entries from the CURRENT term by
-		// counting replicas. An old-term entry can be on a majority and
-		// still be overwritten by a later leader, so it only becomes
-		// committed indirectly, when a current-term entry after it commits.
 		if rf.log[n].Term != rf.currentTerm {
 			break
 		}
-		count := 1 // our own log
+		count := 1
 		for peer := range rf.peers {
 			if peer != rf.id && rf.matchIndex[peer] >= n {
 				count++
@@ -514,17 +525,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	rf.resetElectionTimer()
 
-	// Rule 1: our log is too short to contain PrevLogIndex.
 	if args.PrevLogIndex >= len(rf.log) {
 		return
 	}
-	// Rule 2: we have that index, but the term doesn't match.
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		return
 	}
 
-	// Rule 3: append new entries. Truncate ONLY on a real conflict,
-	// otherwise a delayed duplicate RPC would delete good entries.
 	logChanged := false
 	for i, entry := range args.Entries {
 		idx := args.PrevLogIndex + 1 + i
@@ -534,7 +541,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				logChanged = true
 				break
 			}
-			// same term at same index: already have it, keep going
 		} else {
 			rf.log = append(rf.log, args.Entries[i:]...)
 			logChanged = true
@@ -542,10 +548,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 	if logChanged {
-		rf.persist() // before we reply Success
+		rf.persist()
 	}
 
-	// Rule 4: advance commitIndex.
 	if args.LeaderCommit > rf.commitIndex {
 		lastNew := args.PrevLogIndex + len(args.Entries)
 		rf.commitIndex = min(args.LeaderCommit, lastNew)
@@ -561,30 +566,26 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.VoteGranted = false
 
-	// 1. Reject stale term.
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		return
 	}
 
-	// 2. Update newer term.
 	if args.Term > rf.currentTerm {
 		rf.becomeFollower(args.Term)
 	}
 
 	reply.Term = rf.currentTerm
 
-	// 3. Check candidate log.
 	lastIndex := len(rf.log) - 1
 	lastTerm := rf.log[lastIndex].Term
 
 	upToDate := args.LastLogTerm > lastTerm ||
 		(args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex)
 
-	// 4. Grant vote if allowed.
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && upToDate {
 		rf.votedFor = args.CandidateId
-		rf.persist() // vote must be on disk before we reply "granted"
+		rf.persist()
 		reply.VoteGranted = true
 		rf.resetElectionTimer()
 	}
