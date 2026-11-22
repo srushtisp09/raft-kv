@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"math/rand"
 	"sync"
 	"testing"
@@ -200,5 +201,159 @@ func TestChaosLossyNetworkStillCommits(t *testing.T) {
 				t.Fatalf("node %d never applied chaos-1", i)
 			}
 		}
+	}
+}
+
+// collector records every ApplyMsg from a node's applyCh, across restarts.
+type collector struct {
+	mu      sync.Mutex
+	applied map[int]string // index -> command
+	bad     string         // first violation found
+}
+
+func newCollector() *collector {
+	return &collector{applied: map[int]string{}}
+}
+
+func (col *collector) record(m ApplyMsg) {
+	col.mu.Lock()
+	defer col.mu.Unlock()
+	if prev, ok := col.applied[m.Index]; ok && prev != m.Command && col.bad == "" {
+		col.bad = fmt.Sprintf("index %d applied %q then %q on the same node", m.Index, prev, m.Command)
+	}
+	col.applied[m.Index] = m.Command
+}
+
+func TestChaosRandomCrashesAndPartitions(t *testing.T) {
+	const n = 5
+	c := makeChaosCluster(n)
+	defer c.killAll()
+
+	c.net.mu.Lock()
+	c.net.dropRate = 0.05
+	c.net.maxDelay = 15 * time.Millisecond
+	c.net.mu.Unlock()
+
+	cols := make([]*collector, n)
+	for i := range cols {
+		cols[i] = newCollector()
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// One drainer per node; it follows restarts by re-reading the channel.
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for {
+				c.mu.Lock()
+				ch := c.applyChs[i]
+				c.mu.Unlock()
+				select {
+				case m := <-ch:
+					cols[i].record(m)
+				case <-stop:
+					return
+				case <-time.After(20 * time.Millisecond):
+				}
+			}
+		}(i)
+	}
+
+	// Client: keep proposing unique commands to whoever is leader.
+	var seq int64
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			seq++
+			cmd := fmt.Sprintf("cmd-%d", seq)
+			for i := 0; i < n; i++ {
+				if _, _, ok := c.node(i).Start(cmd); ok {
+					break
+				}
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+	}()
+
+	// Chaos: random crashes, restarts, partitions. Never more than 2 nodes
+	// down at once, so a majority can still exist.
+	downNow := map[int]bool{}
+	end := time.Now().Add(8 * time.Second)
+	for time.Now().Before(end) {
+		switch rand.Intn(4) {
+		case 0: // crash a node
+			if len(downNow) < 2 {
+				i := rand.Intn(n)
+				if !downNow[i] {
+					c.crash(i)
+					downNow[i] = true
+				}
+			}
+		case 1: // restart a node
+			for i := range downNow {
+				c.restart(i)
+				delete(downNow, i)
+				break
+			}
+		case 2: // random partition into two groups
+			g := map[int]int{}
+			for i := 0; i < n; i++ {
+				g[i] = rand.Intn(2)
+			}
+			c.net.setPartition(g)
+		case 3:
+			c.net.heal()
+		}
+		time.Sleep(time.Duration(100+rand.Intn(300)) * time.Millisecond)
+	}
+
+	// Heal everything and let the cluster settle.
+	c.net.heal()
+	for i := range downNow {
+		c.restart(i)
+	}
+	c.net.mu.Lock()
+	c.net.dropRate = 0
+	c.net.maxDelay = 0
+	c.net.mu.Unlock()
+	time.Sleep(3 * time.Second)
+
+	close(stop)
+	wg.Wait()
+
+	// Check 1: no node ever applied two different commands at one index.
+	for i, col := range cols {
+		if col.bad != "" {
+			t.Fatalf("node %d: %s", i, col.bad)
+		}
+	}
+	// Check 2: nodes agree with each other at every index they share.
+	for i := 0; i < n; i++ {
+		for j := i + 1; j < n; j++ {
+			for idx, a := range cols[i].applied {
+				if b, ok := cols[j].applied[idx]; ok && a != b {
+					t.Fatalf("nodes %d and %d disagree at index %d: %q vs %q", i, j, idx, a, b)
+				}
+			}
+		}
+	}
+	committed := 0
+	for _, col := range cols {
+		if len(col.applied) > committed {
+			committed = len(col.applied)
+		}
+	}
+	t.Logf("highest number of entries applied on one node: %d", committed)
+	if committed == 0 {
+		t.Fatal("nothing was committed during the whole run")
 	}
 }
