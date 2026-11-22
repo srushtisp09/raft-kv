@@ -112,3 +112,51 @@ func (ck *Clerk) Delete(key string) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// tryOp is like Get/Put/Delete but gives up after timeout.
+// ok=false means "unknown": the operation may or may not have taken effect.
+func (ck *Clerk) tryOp(typ, key, value string, timeout time.Duration) (string, bool) {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+
+	ck.seqNum++
+	op := Op{Type: typ, Key: key, Value: value, ClientID: ck.clientID, SeqNum: ck.seqNum}
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for i := 0; i < len(ck.servers); i++ {
+			idx := (ck.leader + i) % len(ck.servers)
+
+			var v string
+			var err error
+			switch typ {
+			case "Get":
+				v, err = ck.servers[idx].GetWithOp(op)
+			case "Put":
+				err = ck.servers[idx].PutWithOp(op)
+			case "Delete":
+				err = ck.servers[idx].DeleteWithOp(op)
+			}
+			if err == nil {
+				ck.leader = idx
+				return v, true
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return "", false
+}
+
+func (ck *Clerk) TryGet(key string, timeout time.Duration) (string, bool) {
+	return ck.tryOp("Get", key, "", timeout)
+}
+
+func (ck *Clerk) TryPut(key, value string, timeout time.Duration) bool {
+	_, ok := ck.tryOp("Put", key, value, timeout)
+	return ok
+}
+
+func (ck *Clerk) TryDelete(key string, timeout time.Duration) bool {
+	_, ok := ck.tryOp("Delete", key, "", timeout)
+	return ok
+}
