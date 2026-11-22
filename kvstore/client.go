@@ -1,12 +1,10 @@
 package kvstore
 
 import (
+	"math/rand"
 	"sync"
-	"sync/atomic"
 	"time"
 )
-
-var nextClientID int64
 
 type Clerk struct {
 	mu sync.Mutex
@@ -18,12 +16,13 @@ type Clerk struct {
 	seqNum   int64
 }
 
-// MakeClerk creates a new client.
+// MakeClerk creates a new client. The ID is random and positive, so separate
+// client processes don't collide and it can never equal the reserved -1.
 func MakeClerk(servers []KVService) *Clerk {
 	return &Clerk{
 		servers:  servers,
 		leader:   0,
-		clientID: atomic.AddInt64(&nextClientID, 1),
+		clientID: rand.Int63n(1<<62) + 1,
 	}
 }
 
@@ -34,6 +33,7 @@ func (ck *Clerk) Get(key string) string {
 
 	ck.seqNum++
 
+	// Built once: every retry reuses the same SeqNum (exactly-once).
 	op := Op{
 		Type:     "Get",
 		Key:      key,
@@ -46,14 +46,9 @@ func (ck *Clerk) Get(key string) string {
 			serverIndex := (ck.leader + i) % len(ck.servers)
 
 			value, err := ck.servers[serverIndex].GetWithOp(op)
-
 			if err == nil {
 				ck.leader = serverIndex
 				return value
-			}
-
-			if err == ErrWrongLeader || err == ErrTimeout {
-				continue
 			}
 		}
 
@@ -80,15 +75,9 @@ func (ck *Clerk) Put(key, value string) {
 		for i := 0; i < len(ck.servers); i++ {
 			serverIndex := (ck.leader + i) % len(ck.servers)
 
-			err := ck.servers[serverIndex].PutWithOp(op)
-
-			if err == nil {
+			if err := ck.servers[serverIndex].PutWithOp(op); err == nil {
 				ck.leader = serverIndex
 				return
-			}
-
-			if err == ErrWrongLeader || err == ErrTimeout {
-				continue
 			}
 		}
 
@@ -114,15 +103,9 @@ func (ck *Clerk) Delete(key string) {
 		for i := 0; i < len(ck.servers); i++ {
 			serverIndex := (ck.leader + i) % len(ck.servers)
 
-			err := ck.servers[serverIndex].DeleteWithOp(op)
-
-			if err == nil {
+			if err := ck.servers[serverIndex].DeleteWithOp(op); err == nil {
 				ck.leader = serverIndex
 				return
-			}
-
-			if err == ErrWrongLeader || err == ErrTimeout {
-				continue
 			}
 		}
 
