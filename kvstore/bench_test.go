@@ -2,6 +2,7 @@ package kvstore
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -11,7 +12,9 @@ import (
 	"github.com/srushtisp09/raft-kv/raft"
 )
 
-func newBenchCluster(t *testing.T, n int, useFile bool) *kvChaos {
+// newBenchCluster builds an n-node cluster. With useFile it persists to real
+// files in dir; otherwise it persists in memory.
+func newBenchCluster(n int, useFile bool, dir string) *kvChaos {
 	c := &kvChaos{
 		net:   newKVNet(),
 		peers: make([]string, n),
@@ -20,7 +23,7 @@ func newBenchCluster(t *testing.T, n int, useFile bool) *kvChaos {
 	}
 	for i := 0; i < n; i++ {
 		if useFile {
-			c.pers[i] = raft.NewFilePersister(filepath.Join(t.TempDir(), "raft-state"))
+			c.pers[i] = raft.NewFilePersister(filepath.Join(dir, fmt.Sprintf("node%d", i)))
 		} else {
 			c.pers[i] = &raft.MemPersister{}
 		}
@@ -28,7 +31,6 @@ func newBenchCluster(t *testing.T, n int, useFile bool) *kvChaos {
 	for i := 0; i < n; i++ {
 		c.start(i)
 	}
-	t.Cleanup(c.killAll)
 	return c
 }
 
@@ -62,12 +64,29 @@ func runThroughput(c *kvChaos, n, clients int, dur time.Duration) float64 {
 }
 
 func TestBenchThroughput(t *testing.T) {
+	var dirs []string
+	// Delete the temp folders only at the very end, after everything stopped.
+	defer func() {
+		time.Sleep(500 * time.Millisecond)
+		for _, d := range dirs {
+			os.RemoveAll(d)
+		}
+	}()
+
 	for _, useFile := range []bool{false, true} {
 		for _, clients := range []int{1, 4, 16} {
-			c := newBenchCluster(t, 3, useFile)
+			dir, err := os.MkdirTemp("", "raftbench")
+			if err != nil {
+				t.Fatal(err)
+			}
+			dirs = append(dirs, dir)
+
+			c := newBenchCluster(3, useFile, dir)
 			rate := runThroughput(c, 3, clients, 5*time.Second)
 			t.Logf("fsync-to-disk=%-5v clients=%-2d  %.0f puts/sec", useFile, clients, rate)
+
 			c.killAll()
+			time.Sleep(300 * time.Millisecond)
 		}
 	}
 }

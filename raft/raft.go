@@ -40,7 +40,7 @@ type Raft struct {
 	id    int
 	peers []string
 
-	// Swappable transport (fake in tests, real net/rpc later).
+	// Swappable transport (fake in tests, real net/rpc in production).
 	sendRequestVote   func(peer int, args *RequestVoteArgs, reply *RequestVoteReply) bool
 	sendAppendEntries func(peer int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool
 
@@ -69,6 +69,9 @@ type Raft struct {
 	// Committed entries are delivered here, in order.
 	applyCh chan ApplyMsg
 
+	// Signaled whenever commitIndex advances, so the applier wakes immediately.
+	applyNotify chan struct{}
+
 	stopCh   chan struct{}
 	killOnce sync.Once
 }
@@ -77,14 +80,15 @@ type Raft struct {
 // ticker and applier.
 func NewRaft(id int, peers []string, applyCh chan ApplyMsg, persister Persister) *Raft {
 	rf := &Raft{
-		id:        id,
-		peers:     peers,
-		votedFor:  -1,
-		log:       []LogEntry{{Term: 0}}, // dummy entry at index 0
-		role:      Follower,
-		applyCh:   applyCh,
-		persister: persister,
-		stopCh:    make(chan struct{}),
+		id:          id,
+		peers:       peers,
+		votedFor:    -1,
+		log:         []LogEntry{{Term: 0}}, // dummy entry at index 0
+		role:        Follower,
+		applyCh:     applyCh,
+		applyNotify: make(chan struct{}, 1),
+		persister:   persister,
+		stopCh:      make(chan struct{}),
 	}
 
 	// No goroutines are running yet, so no lock is needed.
@@ -197,6 +201,15 @@ func (rf *Raft) Kill() {
 	})
 }
 
+// notifyApplier wakes the applier without blocking (the buffer of 1 means
+// repeated signals collapse into one).
+func (rf *Raft) notifyApplier() {
+	select {
+	case rf.applyNotify <- struct{}{}:
+	default:
+	}
+}
+
 // Start is called on the leader when a client sends a command.
 // It returns (index, term, isLeader).
 func (rf *Raft) Start(command string) (int, int, bool) {
@@ -245,13 +258,15 @@ func (rf *Raft) ticker() {
 	}
 }
 
-// applier delivers committed entries to applyCh, in order.
+// applier delivers committed entries to applyCh, in order. It wakes as soon
+// as commitIndex advances; the timeout is only a safety net.
 func (rf *Raft) applier() {
 	for {
 		select {
 		case <-rf.stopCh:
 			return
-		case <-time.After(10 * time.Millisecond):
+		case <-rf.applyNotify:
+		case <-time.After(50 * time.Millisecond): // safety net
 		}
 
 		rf.mu.Lock()
@@ -468,6 +483,7 @@ func (rf *Raft) advanceCommitIndex() {
 		}
 		if count > len(rf.peers)/2 {
 			rf.commitIndex = n
+			rf.notifyApplier() // wake the applier right away
 			break
 		}
 	}
@@ -567,6 +583,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		lastNew := args.PrevLogIndex + len(args.Entries)
 		rf.commitIndex = min(args.LeaderCommit, lastNew)
+		rf.notifyApplier() // wake the applier right away
 	}
 
 	reply.Success = true
